@@ -29,7 +29,7 @@ class CodexService(
 ) {
     companion object {
         private const val TAG = "CodexService"
-        private const val APP_VERSION = "1.1.0"
+        private const val APP_VERSION = "1.1.1"
         private const val THREAD_LIST_LIMIT = 50
         private const val HANDSHAKE_MODE_TRUSTED_RECONNECT = "trusted_reconnect"
     }

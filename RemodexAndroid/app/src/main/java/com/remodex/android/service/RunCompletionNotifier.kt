@@ -103,10 +103,25 @@ class RunCompletionNotifier @Inject constructor(
             .setCategory(NotificationCompat.CATEGORY_STATUS)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
 
-        notificationManager.notify(
-            stableRequestCode(threadId, turnId, result),
-            builder.build()
-        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+            && ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            refreshState()
+            return
+        }
+
+        try {
+            notificationManager.notify(
+                stableRequestCode(threadId, turnId, result),
+                builder.build()
+            )
+        } catch (_: SecurityException) {
+            // Permission can be revoked between the explicit check and notify().
+            refreshState()
+        }
     }
 
     fun buildOpenIntent(threadId: String, turnId: String?): Intent =

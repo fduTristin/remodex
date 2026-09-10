@@ -1,11 +1,13 @@
 package com.remodex.android.service
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -97,7 +99,32 @@ class BackgroundTurnMonitorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val runningThreadCount = maxOf(intent?.getIntExtra(EXTRA_RUNNING_THREAD_COUNT, 1) ?: 1, 1)
         Log.d(TAG, "onStartCommand runningThreadCount=$runningThreadCount startId=$startId")
-        startForeground(NOTIFICATION_ID, buildNotification(runningThreadCount))
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.FOREGROUND_SERVICE
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "Foreground service permission is unavailable")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+            && ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.FOREGROUND_SERVICE_DATA_SYNC
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "Foreground service permission is unavailable")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification(runningThreadCount))
+        } catch (error: SecurityException) {
+            Log.w(TAG, "Unable to start foreground turn monitor: ${error.message}")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (pollJob?.isActive != true) {
             pollJob = scope.launch {
                 while (isActive) {
