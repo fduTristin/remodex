@@ -19,6 +19,11 @@ class SecureTransport(
     private var pendingHandshake: CodexPendingHandshake? = null
     private var lastAppliedBridgeOutboundSeq: Int =
         secureStore.readString(SecureStore.LAST_APPLIED_BRIDGE_OUTBOUND_SEQ)?.toIntOrNull() ?: 0
+    private var lastAppliedBridgeReplayEpoch: String? =
+        secureStore.readString(SecureStore.LAST_APPLIED_BRIDGE_REPLAY_EPOCH)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    private var replayRefreshRequired = false
 
     private val _state = MutableStateFlow(CodexSecureConnectionState.DISCONNECTED)
     val state: StateFlow<CodexSecureConnectionState> = _state.asStateFlow()
@@ -103,9 +108,44 @@ class SecureTransport(
             return null
         }
 
-        val macIdentityPubKey = crypto.fromBase64(serverHello.macIdentityPublicKey)
-        val macEphemeralPubKey = crypto.fromBase64(serverHello.macEphemeralPublicKey)
-        val serverNonce = crypto.fromBase64(serverHello.serverNonce)
+        val expectedMacDeviceId = secureStore.readString(SecureStore.RELAY_MAC_DEVICE_ID)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        val expectedMacIdentityPublicKey = secureStore.readString(SecureStore.RELAY_MAC_IDENTITY_PUBLIC_KEY)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: getTrustedMacRegistry().macs[serverHello.macDeviceId]?.macIdentityPublicKey
+
+        if (expectedMacDeviceId == null
+            || expectedMacIdentityPublicKey == null
+            || serverHello.protocolVersion != SECURE_PROTOCOL_VERSION
+            || serverHello.sessionId != pending.sessionId
+            || serverHello.handshakeMode != pending.handshakeMode
+            || serverHello.clientNonce != crypto.toBase64(pending.clientNonce)
+            || serverHello.macDeviceId != expectedMacDeviceId
+            || serverHello.macIdentityPublicKey != expectedMacIdentityPublicKey
+        ) {
+            Log.e(TAG, "serverHello did not match the active pairing")
+            _state.value = CodexSecureConnectionState.ERROR
+            _lastErrorMessage.value = "The secure bridge identity did not match the paired Mac."
+            return null
+        }
+
+        val macIdentityPubKey: ByteArray
+        val macEphemeralPubKey: ByteArray
+        val serverNonce: ByteArray
+        val macSig: ByteArray
+        try {
+            macIdentityPubKey = crypto.fromBase64(serverHello.macIdentityPublicKey)
+            macEphemeralPubKey = crypto.fromBase64(serverHello.macEphemeralPublicKey)
+            serverNonce = crypto.fromBase64(serverHello.serverNonce)
+            macSig = crypto.fromBase64(serverHello.macSignature)
+        } catch (error: Exception) {
+            Log.e(TAG, "Invalid serverHello encoding: ${error.message}")
+            _state.value = CodexSecureConnectionState.ERROR
+            _lastErrorMessage.value = "The secure bridge handshake was malformed."
+            return null
+        }
 
         val expiresAtStr = serverHello.expiresAtForTranscript ?: "0"
 
@@ -127,7 +167,6 @@ class SecureTransport(
         )
 
         // Verify Mac signature
-        val macSig = crypto.fromBase64(serverHello.macSignature)
         if (!crypto.ed25519Verify(macIdentityPubKey, transcript, macSig)) {
             Log.e(TAG, "Mac signature verification failed")
             _state.value = CodexSecureConnectionState.ERROR
@@ -152,12 +191,13 @@ class SecureTransport(
         session = CodexSecureSession(
             sessionId = pending.sessionId,
             keyEpoch = serverHello.keyEpoch,
+            bridgeReplayEpoch = serverHello.bridgeReplayEpoch?.trim()?.takeIf { it.isNotEmpty() },
             phoneToMacKey = phoneToMacKey,
             macToPhoneKey = macToPhoneKey
         )
 
         // Save trusted Mac
-        saveTrustedMac(serverHello.macDeviceId, serverHello.macIdentityPublicKey, null)
+        saveTrustedMac(serverHello.macDeviceId, serverHello.macIdentityPublicKey, serverHello.displayName)
 
         return SecureClientAuth(
             sessionId = pending.sessionId,
@@ -188,11 +228,26 @@ class SecureTransport(
         Log.d(TAG, "Secure channel established (epoch=${sess.keyEpoch})")
         pendingHandshake = null
         _lastErrorMessage.value = null
+        val bridgeReplayEpoch = sess.bridgeReplayEpoch
+        val previousReplayEpoch = lastAppliedBridgeReplayEpoch
+        if (!bridgeReplayEpoch.isNullOrBlank()
+            && !previousReplayEpoch.isNullOrBlank()
+            && bridgeReplayEpoch != previousReplayEpoch
+        ) {
+            lastAppliedBridgeOutboundSeq = 0
+            secureStore.deleteValue(SecureStore.LAST_APPLIED_BRIDGE_OUTBOUND_SEQ)
+            replayRefreshRequired = true
+        }
+        if (!bridgeReplayEpoch.isNullOrBlank()) {
+            lastAppliedBridgeReplayEpoch = bridgeReplayEpoch
+            secureStore.writeString(SecureStore.LAST_APPLIED_BRIDGE_REPLAY_EPOCH, bridgeReplayEpoch)
+        }
         _state.value = CodexSecureConnectionState.CONNECTED_ENCRYPTED
         return SecureResumeState(
             sessionId = sess.sessionId,
             keyEpoch = sess.keyEpoch,
-            lastAppliedBridgeOutboundSeq = lastAppliedBridgeOutboundSeq
+            lastAppliedBridgeOutboundSeq = lastAppliedBridgeOutboundSeq,
+            bridgeReplayEpoch = bridgeReplayEpoch
         )
     }
 
@@ -312,6 +367,28 @@ class SecureTransport(
     private fun resetReplayState() {
         lastAppliedBridgeOutboundSeq = 0
         secureStore.deleteValue(SecureStore.LAST_APPLIED_BRIDGE_OUTBOUND_SEQ)
+        lastAppliedBridgeReplayEpoch = null
+        secureStore.deleteValue(SecureStore.LAST_APPLIED_BRIDGE_REPLAY_EPOCH)
+        replayRefreshRequired = true
+    }
+
+    fun resetReplayCursor(cursor: Int = 0, replayEpoch: String? = null) {
+        lastAppliedBridgeOutboundSeq = cursor.coerceAtLeast(0)
+        secureStore.writeString(
+            SecureStore.LAST_APPLIED_BRIDGE_OUTBOUND_SEQ,
+            lastAppliedBridgeOutboundSeq.toString()
+        )
+        replayEpoch?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            lastAppliedBridgeReplayEpoch = it
+            secureStore.writeString(SecureStore.LAST_APPLIED_BRIDGE_REPLAY_EPOCH, it)
+        }
+        replayRefreshRequired = true
+    }
+
+    fun consumeReplayRefreshRequired(): Boolean {
+        val required = replayRefreshRequired
+        replayRefreshRequired = false
+        return required
     }
 
     val isEncrypted: Boolean get() = session != null

@@ -29,7 +29,7 @@ class CodexService(
 ) {
     companion object {
         private const val TAG = "CodexService"
-        private const val APP_VERSION = "1.0.0"
+        private const val APP_VERSION = "1.1.0"
         private const val THREAD_LIST_LIMIT = 50
         private const val HANDSHAKE_MODE_TRUSTED_RECONNECT = "trusted_reconnect"
     }
@@ -178,6 +178,7 @@ class CodexService(
     private var pendingNotificationOpenThreadID: String? = null
     private var pendingNotificationOpenTurnID: String? = null
     private var runCompletionNotificationDedupedAt: MutableMap<String, Long> = mutableMapOf()
+    private var bufferedReplayRefreshPending = false
 
     // --- Initialize ---
 
@@ -313,6 +314,8 @@ class CodexService(
         secureStore.writeString(SecureStore.RELAY_SESSION_ID, payload.sessionId)
         secureStore.writeString(SecureStore.RELAY_MAC_DEVICE_ID, payload.macDeviceId)
         secureStore.writeString(SecureStore.RELAY_MAC_IDENTITY_PUBLIC_KEY, payload.macIdentityPublicKey)
+        secureStore.deleteValue(SecureStore.LAST_APPLIED_BRIDGE_OUTBOUND_SEQ)
+        secureStore.deleteValue(SecureStore.LAST_APPLIED_BRIDGE_REPLAY_EPOCH)
 
         connect(payload.relay, payload.sessionId, "qr_bootstrap")
     }
@@ -425,6 +428,8 @@ class CodexService(
         secureStore.deleteValue(SecureStore.RELAY_SESSION_ID)
         secureStore.deleteValue(SecureStore.RELAY_MAC_DEVICE_ID)
         secureStore.deleteValue(SecureStore.RELAY_MAC_IDENTITY_PUBLIC_KEY)
+        secureStore.deleteValue(SecureStore.LAST_APPLIED_BRIDGE_OUTBOUND_SEQ)
+        secureStore.deleteValue(SecureStore.LAST_APPLIED_BRIDGE_REPLAY_EPOCH)
     }
 
     // --- Session Init ---
@@ -432,6 +437,9 @@ class CodexService(
     private fun initializeSession() {
         scope.launch {
             try {
+                if (secureTransport.consumeReplayRefreshRequired()) {
+                    threadHistoryHydrator.reset()
+                }
                 connectionPresentationCoordinator.setBootstrapping(true)
                 supportsStructuredSkillInput = true
                 supportsTurnCollaborationMode = false
@@ -1853,10 +1861,69 @@ class CodexService(
 
     // --- Notifications ---
 
+    private fun handleBufferedReplayControl(
+        normalizedMethod: String,
+        payload: Map<String, JsonValue>
+    ): Boolean {
+        val isReset = normalizedMethod == "remodex/bufferedreplay/reset"
+            || firstBoolValue(payload, "remodexBufferedReplayReset") == true
+        val isGap = normalizedMethod == "remodex/bufferedreplay/gap"
+            || firstBoolValue(payload, "remodexBufferedReplayGap") == true
+        val isComplete = normalizedMethod == "remodex/bufferedreplay/completed"
+            || firstBoolValue(payload, "remodexBufferedReplayComplete") == true
+
+        if (isReset || isGap) {
+            val cursor = if (isGap) {
+                firstLongValue(payload, "lastDiscardedBridgeOutboundSeq")
+            } else {
+                firstLongValue(payload, "resetBridgeOutboundSeqTo")
+            } ?: 0L
+            secureTransport.resetReplayCursor(
+                cursor = cursor.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                replayEpoch = firstStringValue(payload, "bridgeReplayEpoch")
+            )
+            threadHistoryHydrator.reset()
+            bufferedReplayRefreshPending = true
+            return true
+        }
+
+        if (isComplete) {
+            if (bufferedReplayRefreshPending) {
+                bufferedReplayRefreshPending = false
+                val activeThreadId = _activeThreadId.value
+                if (!activeThreadId.isNullOrBlank()) {
+                    requestThreadHistoryLoad(activeThreadId, forceRefresh = true)
+                }
+            }
+            return true
+        }
+
+        return false
+    }
+
+    private fun isReplayOnlyLifecycleOrDelta(method: String): Boolean {
+        return method.contains("turn/started")
+            || method.contains("turn_started")
+            || method.contains("turn/completed")
+            || method.contains("turn_completed")
+            || method.contains("turn/failed")
+            || method.contains("turn_failed")
+            || method.contains("/delta")
+            || method.contains("_delta")
+            || method.contains("agent.delta")
+    }
+
     private fun handleNotification(method: String, params: JsonValue?) {
         val p = params?.objectValue ?: emptyMap()
         val item = p["item"]?.objectValue
         val normalizedMethod = method.lowercase()
+        if (handleBufferedReplayControl(normalizedMethod, p)) {
+            return
+        }
+        val isReplayedEvent = firstBoolValue(p, "remodexReplayedEvent") == true
+        if (isReplayedEvent && isReplayOnlyLifecycleOrDelta(normalizedMethod)) {
+            return
+        }
         val legacyEventType = if (normalizedMethod == "event") {
             firstStringValue(envelopeEventObject(p) ?: emptyMap(), "type")
                 ?.trim()
@@ -1925,13 +1992,13 @@ class CodexService(
                     )
                 }
             }
-            method.contains("turn/started") || method.contains("turn_started") -> {
+            !isReplayedEvent && (method.contains("turn/started") || method.contains("turn_started")) -> {
                 if (threadId != null) {
                     markThreadRunning(threadId)
                     if (turnId != null) activeTurnIdByThread[threadId] = turnId
                 }
             }
-            method.contains("turn/completed") || method.contains("turn_completed") -> {
+            !isReplayedEvent && (method.contains("turn/completed") || method.contains("turn_completed")) -> {
                 if (threadId != null) {
                     clearRunningState(threadId)
                     _readyThreadIDs.value = _readyThreadIDs.value + threadId
@@ -1944,7 +2011,7 @@ class CodexService(
                     )
                 }
             }
-            method.contains("turn/failed") || method.contains("turn_failed") -> {
+            !isReplayedEvent && (method.contains("turn/failed") || method.contains("turn_failed")) -> {
                 if (threadId != null) {
                     clearRunningState(threadId)
                     _failedThreadIDs.value = _failedThreadIDs.value + threadId

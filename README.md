@@ -14,7 +14,7 @@ This fork adds an **Android port** of the original iOS app, built with Kotlin an
 
 ## Download Android APK
 
-[**Download Remodex Android v1.0.0**](https://github.com/EYHN/remodex/releases/download/v1.0.0-android/remodex-android.apk)
+[**Download Remodex Android releases**](https://github.com/EYHN/remodex/releases)
 
 > Install the APK, run `remodex up` on your Mac, then scan the QR code from the app to pair.
 
@@ -48,7 +48,7 @@ If you want the public-repo distribution model explained clearly, read [SELF_HOS
 
 ## Get the App
 
-**Android**: Download the APK from the [latest release](https://github.com/EYHN/remodex/releases/tag/v1.0.0-android), install it, and pair by scanning the QR from `remodex up`.
+**Android**: Download the APK from the [latest release](https://github.com/EYHN/remodex/releases), install it, and pair by scanning the QR from `remodex up`.
 
 **iOS**: Build the iOS app from source in Xcode, install your own signed build on-device, then use the in-app onboarding flow to pair by scanning the QR from `remodex up`.
 
@@ -214,7 +214,7 @@ If you point `REMODEX_RELAY` at your own self-hosted relay, managed push stays o
 
 Published npm packages can embed default private relay settings at pack time via the `prepack` script.
 
-The current package version is `1.3.4`.
+The current package version is `3.1.0`.
 
 To publish the bridge with `api.phodex.app` as the default relay:
 
@@ -280,7 +280,7 @@ Prints the installed Remodex CLI version.
 
 ```sh
 remodex --version
-# => 1.3.4
+# => 3.1.0
 ```
 
 ### `remodex reset-pairing`
@@ -450,10 +450,10 @@ This triggers a debounced deep-link bounce (`codex://settings` → `codex://thre
 
 ```sh
 cd RemodexAndroid
-./gradlew assembleRelease
+./gradlew test lintDebug assembleDebug
 ```
 
-The signed APK will be at `app/build/outputs/apk/release/app-release.apk`. Requires JDK 17+ and Android SDK 35.
+GitHub Actions builds debug APKs on every Android change. A signed release is produced by pushing a tag such as `android-v1.1.0` after configuring the `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` repository secrets. Local release builds use the same variables and write the APK to `app/build/outputs/apk/release/app-release.apk`. Requires JDK 17+ and Android SDK 35.
 
 ## Building the iOS App
 

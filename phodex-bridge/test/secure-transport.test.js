@@ -20,6 +20,7 @@ const {
 const {
   HANDSHAKE_MODE_QR_BOOTSTRAP,
   HANDSHAKE_MODE_TRUSTED_RECONNECT,
+  SECURE_PROTOCOL_VERSION,
   createBridgeSecureTransport,
   nonceForDirection,
 } = require("../src/secure-transport");
@@ -89,7 +90,7 @@ test("secure transport round-trips encrypted payloads after a trusted reconnect 
   secureTransport.handleIncomingWireMessage(
     JSON.stringify({
       kind: "clientHello",
-      protocolVersion: 1,
+      protocolVersion: SECURE_PROTOCOL_VERSION,
       sessionId: "session-2",
       handshakeMode: HANDSHAKE_MODE_TRUSTED_RECONNECT,
       phoneDeviceId: "phone-2",
@@ -112,7 +113,7 @@ test("secure transport round-trips encrypted payloads after a trusted reconnect 
 
   const transcriptBytes = buildTranscriptBytes({
     sessionId: "session-2",
-    protocolVersion: 1,
+    protocolVersion: SECURE_PROTOCOL_VERSION,
     handshakeMode: HANDSHAKE_MODE_TRUSTED_RECONNECT,
     keyEpoch: serverHello.keyEpoch,
     macDeviceId: "mac-2",
@@ -198,6 +199,7 @@ test("secure transport round-trips encrypted payloads after a trusted reconnect 
       sessionId: "session-2",
       keyEpoch: serverHello.keyEpoch,
       lastAppliedBridgeOutboundSeq: 0,
+      bridgeReplayEpoch: serverHello.bridgeReplayEpoch,
     }),
     {
       sendControlMessage(message) {
@@ -487,6 +489,7 @@ test("resume replay does not advance the replay watermark before a phone ack", (
       sessionId: "session-6",
       keyEpoch: serverHello.keyEpoch,
       lastAppliedBridgeOutboundSeq: 0,
+      bridgeReplayEpoch: serverHello.bridgeReplayEpoch,
     }),
     {
       sendControlMessage() {},
@@ -553,7 +556,7 @@ function finishHandshake({
   secureTransport.handleIncomingWireMessage(
     JSON.stringify({
       kind: "clientHello",
-      protocolVersion: 1,
+      protocolVersion: SECURE_PROTOCOL_VERSION,
       sessionId,
       handshakeMode,
       phoneDeviceId,
@@ -576,7 +579,7 @@ function finishHandshake({
 
   const transcriptBytes = buildTranscriptBytes({
     sessionId,
-    protocolVersion: 1,
+    protocolVersion: SECURE_PROTOCOL_VERSION,
     handshakeMode,
     keyEpoch: serverHello.keyEpoch,
     macDeviceId,
@@ -635,6 +638,7 @@ function finishHandshake({
         sessionId,
         keyEpoch: serverHello.keyEpoch,
         lastAppliedBridgeOutboundSeq,
+        bridgeReplayEpoch: serverHello.bridgeReplayEpoch,
       }),
       {
         sendControlMessage(message) {
@@ -712,7 +716,7 @@ function encryptEnvelope(payloadObject, key, sender, counter, sessionId, keyEpoc
   ]);
   return {
     kind: "encryptedEnvelope",
-    v: 1,
+    v: SECURE_PROTOCOL_VERSION,
     sessionId,
     keyEpoch,
     sender,

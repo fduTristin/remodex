@@ -37,7 +37,7 @@ test("readBridgePackageVersionStatus returns immediately while latest version lo
   const firstResult = await readBridgePackageVersionStatus();
 
   assert.equal(fetchCallCount, 1);
-  assert.equal(firstResult.bridgeVersion, "1.3.5");
+  assert.equal(firstResult.bridgeVersion, "3.1.0");
   assert.equal(firstResult.bridgeLatestVersion, null);
 
   deferred.resolve("9.9.9");

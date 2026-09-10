@@ -71,6 +71,7 @@ class SecureStore(context: Context) {
         const val PHONE_IDENTITY_STATE = "phoneIdentityState"
         const val TRUSTED_MAC_REGISTRY = "trustedMacRegistry"
         const val LAST_APPLIED_BRIDGE_OUTBOUND_SEQ = "lastAppliedBridgeOutboundSeq"
+        const val LAST_APPLIED_BRIDGE_REPLAY_EPOCH = "lastAppliedBridgeReplayEpoch"
         const val RENAMED_THREAD_NAMES = "renamedThreadNames"
         const val FORKED_THREAD_ORIGINS = "forkedThreadOrigins"
         const val THREAD_PROJECT_BINDINGS = "threadProjectBindings"

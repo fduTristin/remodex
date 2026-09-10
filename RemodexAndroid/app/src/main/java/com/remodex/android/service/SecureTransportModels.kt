@@ -14,7 +14,7 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 
-const val SECURE_PROTOCOL_VERSION = 1
+const val SECURE_PROTOCOL_VERSION = 2
 const val PAIRING_QR_VERSION = 2
 const val HANDSHAKE_TAG = "remodex-e2ee-v1"
 const val MAX_PAIRING_AGE_MS = 5 * 60 * 1000L
@@ -27,7 +27,8 @@ data class CodexPairingQRPayload(
     val macDeviceId: String,
     val macIdentityPublicKey: String,
     @Serializable(with = FlexibleExpiresAtSerializer::class)
-    val expiresAt: String? = null
+    val expiresAt: String? = null,
+    val displayName: String? = null
 ) {
     val isExpired: Boolean get() {
         val exp = expiresAt?.trim()?.takeIf { it.isNotEmpty() } ?: return false
@@ -120,9 +121,12 @@ data class SecureServerHello(
     val macEphemeralPublicKey: String,
     val serverNonce: String,
     val keyEpoch: Int,
+    val bridgeReplayEpoch: String? = null,
+    @Serializable(with = FlexibleExpiresAtSerializer::class)
     val expiresAtForTranscript: String? = null,
     val macSignature: String,
-    val clientNonce: String? = null
+    val clientNonce: String? = null,
+    val displayName: String? = null
 )
 
 @Serializable
@@ -147,7 +151,8 @@ data class SecureResumeState(
     val kind: String = "resumeState",
     val sessionId: String,
     val keyEpoch: Int,
-    val lastAppliedBridgeOutboundSeq: Int? = null
+    val lastAppliedBridgeOutboundSeq: Int? = null,
+    val bridgeReplayEpoch: String? = null
 )
 
 @Serializable
@@ -160,7 +165,7 @@ data class SecureErrorMessage(
 @Serializable
 data class SecureEnvelope(
     val kind: String = "encryptedEnvelope",
-    val v: Int = 1,
+    val v: Int = SECURE_PROTOCOL_VERSION,
     val sessionId: String,
     val keyEpoch: Int,
     val sender: String,
@@ -179,6 +184,7 @@ data class SecureApplicationPayload(
 data class CodexSecureSession(
     val sessionId: String,
     val keyEpoch: Int,
+    val bridgeReplayEpoch: String?,
     val phoneToMacKey: ByteArray,
     val macToPhoneKey: ByteArray,
     var phoneCounter: Long = 0,
