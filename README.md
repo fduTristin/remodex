@@ -453,7 +453,7 @@ cd RemodexAndroid
 ./gradlew test lintDebug assembleDebug
 ```
 
-GitHub Actions builds debug APKs on every Android change. A signed release is produced by pushing a tag such as `android-v1.1.0` after configuring the `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` repository secrets. Local release builds use the same variables and write the APK to `app/build/outputs/apk/release/app-release.apk`. Requires JDK 17+ and Android SDK 35.
+GitHub Actions builds debug APKs on every Android change. A signed release is produced by pushing a tag such as `android-v1.1.2` after configuring the `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` repository secrets. Local release builds use the same variables and write the APK to `app/build/outputs/apk/release/app-release.apk`. Requires JDK 17+ and Android SDK 35.
 
 ## Building the iOS App
 

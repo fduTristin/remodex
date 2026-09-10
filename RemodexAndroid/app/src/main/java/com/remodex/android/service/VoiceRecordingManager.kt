@@ -1,10 +1,14 @@
 package com.remodex.android.service
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,7 +33,9 @@ data class VoiceRecordingClip(
 
 class VoiceRecordingException(message: String) : IllegalStateException(message)
 
-class VoiceRecordingManager {
+class VoiceRecordingManager(
+    private val context: Context
+) {
     companion object {
         private const val TARGET_SAMPLE_RATE_HZ = 24_000
         private const val MAX_AUDIO_LEVELS = 240
@@ -150,6 +156,14 @@ class VoiceRecordingManager {
     }
 
     private fun createAudioRecord(): Triple<AudioRecord, Int, Int>? {
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return null
+        }
+
         CANDIDATE_SAMPLE_RATES_HZ.forEach { sampleRate ->
             val minBufferSize = AudioRecord.getMinBufferSize(
                 sampleRate,
@@ -161,7 +175,7 @@ class VoiceRecordingManager {
             }
 
             val bufferSize = max(minBufferSize, sampleRate / 2)
-            val recorder = runCatching {
+            val recorder = try {
                 AudioRecord(
                     MediaRecorder.AudioSource.MIC,
                     sampleRate,
@@ -169,7 +183,9 @@ class VoiceRecordingManager {
                     AudioFormat.ENCODING_PCM_16BIT,
                     bufferSize
                 )
-            }.getOrNull() ?: return@forEach
+            } catch (_: SecurityException) {
+                return@forEach
+            }
 
             if (recorder.state == AudioRecord.STATE_INITIALIZED) {
                 return Triple(recorder, bufferSize, sampleRate)

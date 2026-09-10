@@ -168,7 +168,7 @@ fun TurnComposer(
         (selectedReasoningEffort ?: resolvedModelOption?.defaultReasoningEffort ?: "auto")
             .replaceFirstChar { it.uppercase() }
     }
-    val voiceRecordingManager = remember { VoiceRecordingManager() }
+    val voiceRecordingManager = remember(context) { VoiceRecordingManager(context) }
     val voiceAudioLevels by voiceRecordingManager.audioLevels.collectAsState()
     val voiceRecordingDurationMs by voiceRecordingManager.recordingDurationMs.collectAsState()
     val availableSlashCommands = remember(supportsReviewCommand, supportsForkCommand) {
