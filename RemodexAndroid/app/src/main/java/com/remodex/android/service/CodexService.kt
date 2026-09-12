@@ -29,7 +29,7 @@ class CodexService(
 ) {
     companion object {
         private const val TAG = "CodexService"
-        private const val APP_VERSION = "1.1.2"
+        private const val APP_VERSION = "1.1.3"
         private const val THREAD_LIST_LIMIT = 50
         private const val HANDSHAKE_MODE_TRUSTED_RECONNECT = "trusted_reconnect"
     }
@@ -1013,6 +1013,101 @@ class CodexService(
         }
     }
 
+    private suspend fun createContinuationThread(archivedThreadId: String): CodexThread {
+        val sourceThread = thread(archivedThreadId)
+        val preferredProjectPath = sourceThread?.gitWorkingDirectory
+            ?.let(CodexThread::normalizeProjectPath)
+        var includesServiceTier = _selectedServiceTier.value != null
+
+        while (true) {
+            val params = mutableMapOf<String, JsonValue>()
+            preferredProjectPath?.let { params["cwd"] = JsonValue.string(it) }
+            runtimeModelIdentifierForTurn()?.let { params["model"] = JsonValue.string(it) }
+            if (includesServiceTier) {
+                _selectedServiceTier.value?.let {
+                    params["serviceTier"] = JsonValue.string(it.name.lowercase())
+                }
+            }
+
+            val result = try {
+                requireSuccessfulResponse(
+                    messageTransport.sendRequest("thread/start", JsonValue.ObjectValue(params)),
+                    "thread/start"
+                )
+            } catch (error: Exception) {
+                if (includesServiceTier && shouldRetryWithoutServiceTier(error)) {
+                    Log.w(TAG, "Retrying continuation thread/start without serviceTier: ${error.message}")
+                    includesServiceTier = false
+                    continue
+                }
+                throw error
+            }
+
+            val resultObject = result.result?.objectValue
+            val decodedThread = resultObject
+                ?.get("thread")
+                ?.let { CodexThread.fromJson(json, it.toJsonElement()) }
+                ?.let { applyPreferredProjectFallback(it, preferredProjectPath) }
+            val threadId = resultObject?.get("threadId")?.stringValue
+                ?: resultObject?.get("thread_id")?.stringValue
+                ?: resultObject?.get("id")?.stringValue
+                ?: decodedThread?.id
+
+            val continuationThread = decodedThread
+                ?: threadId?.let { CodexThread(id = it, cwd = preferredProjectPath) }
+                ?: throw IllegalStateException("thread/start response missing continuation thread")
+
+            upsertThread(continuationThread)
+            selectThread(continuationThread.id)
+            appendMessage(
+                continuationThread.id,
+                CodexMessage(
+                    threadId = continuationThread.id,
+                    role = CodexMessageRole.SYSTEM,
+                    kind = CodexMessageKind.CHAT,
+                    text = "Continued from archived thread `$archivedThreadId`",
+                    orderIndex = CodexMessageOrderCounter.next(),
+                    deliveryState = CodexMessageDeliveryState.CONFIRMED
+                )
+            )
+            return thread(continuationThread.id) ?: continuationThread
+        }
+    }
+
+    private suspend fun recoverFromMissingThread(
+        threadId: String,
+        pendingMessage: CodexMessage
+    ): Pair<String, CodexMessage> {
+        // Create the replacement first so a failure does not strand the pending message.
+        val continuationThread = createContinuationThread(threadId)
+        removeMessage(threadId, pendingMessage.id)
+        handleMissingThread(threadId)
+
+        val movedMessage = pendingMessage.copy(
+            threadId = continuationThread.id,
+            deliveryState = CodexMessageDeliveryState.PENDING
+        )
+        appendMessage(continuationThread.id, movedMessage)
+        return continuationThread.id to movedMessage
+    }
+
+    private fun handleMissingThread(threadId: String) {
+        val currentMessages = getThreadMessages(threadId)
+        val stoppedMessages = currentMessages.map { message ->
+            if (message.isStreaming) {
+                message.copy(isStreaming = false)
+            } else {
+                message
+            }
+        }
+        if (stoppedMessages != currentMessages) {
+            setThreadMessages(threadId, stoppedMessages)
+        }
+
+        setThreadArchivedLocally(threadId, isArchived = true)
+        Log.w(TAG, "Archived stale thread locally after runtime reported it missing: $threadId")
+    }
+
     suspend fun moveThreadToProjectPath(threadId: String, projectPath: String): CodexThread {
         val normalizedThreadId = threadId.trim().takeIf { it.isNotEmpty() }
             ?: throw IllegalArgumentException("A thread id is required.")
@@ -1394,136 +1489,150 @@ class CodexService(
         appendMessage(tid, optimisticMsg)
 
         scope.launch {
+            var targetThreadId = tid
+            var pendingMessage = optimisticMsg
+            var didRecoverMissingThread = false
             var includeStructuredSkillItems = supportsStructuredSkillInput && skillMentions.isNotEmpty()
             var effectiveCollaborationMode =
                 if (supportsTurnCollaborationMode) collaborationMode else null
             var didDowngradePlanModeForRuntime = false
 
-            // Resume the thread on the runtime before turn/start (matches iOS ensureThreadResumed flow).
-            // Without this, turn/start fails with "thread not found" after a bridge/runtime restart.
             try {
-                ensureThreadResumed(threadId = tid)
-            } catch (e: Exception) {
-                Log.w(TAG, "thread/resume failed before turn/start, proceeding anyway: ${e.message}")
-            }
-
-            while (true) {
+                // Resume the thread on the runtime before turn/start (matches iOS ensureThreadResumed flow).
+                // Without this, turn/start fails with "thread not found" after a bridge/runtime restart.
                 try {
-                    val params = mutableMapOf<String, JsonValue>(
-                        "threadId" to JsonValue.string(tid)
-                    )
-
-                    val inputItems = mutableListOf<JsonValue>()
-                    attachments.forEach { att ->
-                        val payloadDataUrl = att.payloadDataURL?.trim().orEmpty()
-                        if (payloadDataUrl.isNotEmpty()) {
-                            inputItems += JsonValue.obj(
-                                "type" to JsonValue.string("image"),
-                                "url" to JsonValue.string(payloadDataUrl)
-                            )
-                        }
-                    }
-                    if (trimmedText.isNotEmpty()) {
-                        inputItems += JsonValue.obj(
-                            "type" to JsonValue.string("text"),
-                            "text" to JsonValue.string(trimmedText)
-                        )
-                    }
-                    if (includeStructuredSkillItems) {
-                        skillMentions.forEach { mention ->
-                            val normalizedSkillId = mention.id.trim()
-                            if (normalizedSkillId.isEmpty()) {
-                                return@forEach
-                            }
-
-                            val skillPayload = mutableMapOf<String, JsonValue>(
-                                "type" to JsonValue.string("skill"),
-                                "id" to JsonValue.string(normalizedSkillId)
-                            )
-                            mention.name?.trim()?.takeIf { it.isNotEmpty() }?.let {
-                                skillPayload["name"] = JsonValue.string(it)
-                            }
-                            mention.path?.trim()?.takeIf { it.isNotEmpty() }?.let {
-                                skillPayload["path"] = JsonValue.string(it)
-                            }
-                            inputItems += JsonValue.ObjectValue(skillPayload)
-                        }
-                    }
-                    params["input"] = JsonValue.ArrayValue(inputItems)
-
-                    if (attachments.isNotEmpty()) {
-                        params["images"] = JsonValue.array(*attachments.map { att ->
-                            JsonValue.obj(
-                                "url" to JsonValue.string(att.payloadDataURL ?: ""),
-                                "thumbnail" to JsonValue.string(att.thumbnailBase64JPEG ?: "")
-                            )
-                        }.toTypedArray())
-                    }
-
-                    runtimeModelIdentifierForTurn()?.let { params["model"] = JsonValue.string(it) }
-                    selectedReasoningEffortForSelectedModel()?.let { params["effort"] = JsonValue.string(it) }
-                    _selectedServiceTier.value?.let { params["serviceTier"] = JsonValue.string(it.name.lowercase()) }
-                    effectiveCollaborationMode?.let {
-                        params["collaborationMode"] = buildCollaborationModePayload(it)
-                    }
-
-                    requireSuccessfulResponse(
-                        sendTurnStartRequest(params),
-                        "turn/start"
-                    )
-
-                    updateMessageDeliveryState(tid, optimisticMsg.id, CodexMessageDeliveryState.CONFIRMED)
-                    markThreadRunning(tid)
-
-                    if (didDowngradePlanModeForRuntime) {
-                        appendMessage(
-                            tid,
-                            CodexMessage(
-                                threadId = tid,
-                                role = CodexMessageRole.SYSTEM,
-                                kind = CodexMessageKind.CHAT,
-                                text = "Plan mode is not supported by this runtime. Sent as a normal turn instead.",
-                                orderIndex = CodexMessageOrderCounter.next(),
-                                deliveryState = CodexMessageDeliveryState.CONFIRMED
-                            )
-                        )
-                    }
-
-                    return@launch
+                    ensureThreadResumed(threadId = targetThreadId)
                 } catch (e: Exception) {
-                    if (includeStructuredSkillItems && shouldRetryTurnStartWithoutSkillItems(e)) {
-                        Log.w(TAG, "Retrying turn/start without structured skill items: ${e.message}")
-                        supportsStructuredSkillInput = false
-                        includeStructuredSkillItems = false
-                        continue
+                    if (shouldTreatAsThreadNotFound(e) && !didRecoverMissingThread) {
+                        val recovered = recoverFromMissingThread(targetThreadId, pendingMessage)
+                        targetThreadId = recovered.first
+                        pendingMessage = recovered.second
+                        didRecoverMissingThread = true
+                        ensureThreadResumed(threadId = targetThreadId)
+                    } else {
+                        Log.w(TAG, "thread/resume failed before turn/start, proceeding anyway: ${e.message}")
                     }
-
-                    if (effectiveCollaborationMode != null
-                        && shouldRetryTurnStartWithoutCollaborationMode(e)
-                    ) {
-                        Log.w(TAG, "Retrying turn/start without collaborationMode: ${e.message}")
-                        supportsTurnCollaborationMode = false
-                        effectiveCollaborationMode = null
-                        didDowngradePlanModeForRuntime = true
-                        continue
-                    }
-
-                    Log.e(TAG, "Send message failed: ${e.message}")
-                    updateMessageDeliveryState(tid, optimisticMsg.id, CodexMessageDeliveryState.FAILED)
-                    clearRunningState(tid)
-                    appendMessage(
-                        tid,
-                        CodexMessage(
-                            threadId = tid,
-                            role = CodexMessageRole.SYSTEM,
-                            kind = CodexMessageKind.CHAT,
-                            text = "Send error: ${e.message ?: "Unknown error"}",
-                            orderIndex = CodexMessageOrderCounter.next(),
-                            deliveryState = CodexMessageDeliveryState.CONFIRMED
-                        )
-                    )
-                    return@launch
                 }
+
+                while (true) {
+                    try {
+                        val params = mutableMapOf<String, JsonValue>(
+                            "threadId" to JsonValue.string(targetThreadId)
+                        )
+
+                        val inputItems = mutableListOf<JsonValue>()
+                        attachments.forEach { att ->
+                            val payloadDataUrl = att.payloadDataURL?.trim().orEmpty()
+                            if (payloadDataUrl.isNotEmpty()) {
+                                inputItems += JsonValue.obj(
+                                    "type" to JsonValue.string("image"),
+                                    "url" to JsonValue.string(payloadDataUrl)
+                                )
+                            }
+                        }
+                        if (trimmedText.isNotEmpty()) {
+                            inputItems += JsonValue.obj(
+                                "type" to JsonValue.string("text"),
+                                "text" to JsonValue.string(trimmedText)
+                            )
+                        }
+                        if (includeStructuredSkillItems) {
+                            skillMentions.forEach { mention ->
+                                val normalizedSkillId = mention.id.trim()
+                                if (normalizedSkillId.isEmpty()) {
+                                    return@forEach
+                                }
+
+                                val skillPayload = mutableMapOf<String, JsonValue>(
+                                    "type" to JsonValue.string("skill"),
+                                    "id" to JsonValue.string(normalizedSkillId)
+                                )
+                                mention.name?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                                    skillPayload["name"] = JsonValue.string(it)
+                                }
+                                mention.path?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                                    skillPayload["path"] = JsonValue.string(it)
+                                }
+                                inputItems += JsonValue.ObjectValue(skillPayload)
+                            }
+                        }
+                        params["input"] = JsonValue.ArrayValue(inputItems)
+
+                        runtimeModelIdentifierForTurn()?.let { params["model"] = JsonValue.string(it) }
+                        selectedReasoningEffortForSelectedModel()?.let { params["effort"] = JsonValue.string(it) }
+                        _selectedServiceTier.value?.let { params["serviceTier"] = JsonValue.string(it.name.lowercase()) }
+                        effectiveCollaborationMode?.let {
+                            params["collaborationMode"] = buildCollaborationModePayload(it)
+                        }
+
+                        requireSuccessfulResponse(
+                            sendTurnStartRequest(params),
+                            "turn/start"
+                        )
+
+                        updateMessageDeliveryState(
+                            targetThreadId,
+                            pendingMessage.id,
+                            CodexMessageDeliveryState.CONFIRMED
+                        )
+                        markThreadRunning(targetThreadId)
+
+                        if (didDowngradePlanModeForRuntime) {
+                            appendMessage(
+                                targetThreadId,
+                                CodexMessage(
+                                    threadId = targetThreadId,
+                                    role = CodexMessageRole.SYSTEM,
+                                    kind = CodexMessageKind.CHAT,
+                                    text = "Plan mode is not supported by this runtime. Sent as a normal turn instead.",
+                                    orderIndex = CodexMessageOrderCounter.next(),
+                                    deliveryState = CodexMessageDeliveryState.CONFIRMED
+                                )
+                            )
+                        }
+
+                        return@launch
+                    } catch (e: Exception) {
+                        if (includeStructuredSkillItems && shouldRetryTurnStartWithoutSkillItems(e)) {
+                            Log.w(TAG, "Retrying turn/start without structured skill items: ${e.message}")
+                            supportsStructuredSkillInput = false
+                            includeStructuredSkillItems = false
+                            continue
+                        }
+
+                        if (effectiveCollaborationMode != null
+                            && shouldRetryTurnStartWithoutCollaborationMode(e)
+                        ) {
+                            Log.w(TAG, "Retrying turn/start without collaborationMode: ${e.message}")
+                            supportsTurnCollaborationMode = false
+                            effectiveCollaborationMode = null
+                            didDowngradePlanModeForRuntime = true
+                            continue
+                        }
+
+                        if (shouldTreatAsThreadNotFound(e) && !didRecoverMissingThread) {
+                            val recovered = recoverFromMissingThread(targetThreadId, pendingMessage)
+                            targetThreadId = recovered.first
+                            pendingMessage = recovered.second
+                            didRecoverMissingThread = true
+                            ensureThreadResumed(threadId = targetThreadId)
+                            continue
+                        }
+
+                        recordSendFailure(
+                            threadId = targetThreadId,
+                            messageId = pendingMessage.id,
+                            error = e
+                        )
+                        return@launch
+                    }
+                }
+            } catch (e: Exception) {
+                recordSendFailure(
+                    threadId = targetThreadId,
+                    messageId = pendingMessage.id,
+                    error = e
+                )
             }
         }
     }
@@ -2757,6 +2866,20 @@ class CodexService(
             || message.contains("unrecognized")
             || message.contains("type")
             || message.contains("field")
+    }
+
+    private fun shouldTreatAsThreadNotFound(error: Exception): Boolean {
+        val message = (error as? RpcRequestException)?.rpcMessage
+            ?: error.message.orEmpty()
+        val normalized = message.lowercase()
+        if (normalized.contains("not materialized") || normalized.contains("not yet materialized")) {
+            return false
+        }
+
+        return normalized.contains("thread not found")
+            || normalized.contains("unknown thread")
+            || normalized.contains("no such thread")
+            || normalized.contains("thread does not exist")
     }
 
     private fun shouldRetryTurnStartWithoutCollaborationMode(error: Exception): Boolean {
@@ -5468,6 +5591,38 @@ class CodexService(
 
     private fun getThreadMessages(threadId: String): List<CodexMessage> =
         _messagesByThread.value[threadId] ?: emptyList()
+
+    private fun recordSendFailure(
+        threadId: String,
+        messageId: String,
+        error: Exception
+    ) {
+        Log.e(TAG, "Send message failed: ${error.message}")
+        updateMessageDeliveryState(threadId, messageId, CodexMessageDeliveryState.FAILED)
+        clearRunningState(threadId)
+        appendMessage(
+            threadId,
+            CodexMessage(
+                threadId = threadId,
+                role = CodexMessageRole.SYSTEM,
+                kind = CodexMessageKind.CHAT,
+                text = "Send error: ${error.message ?: "Unknown error"}",
+                orderIndex = CodexMessageOrderCounter.next(),
+                deliveryState = CodexMessageDeliveryState.CONFIRMED
+            )
+        )
+    }
+
+    private fun removeMessage(threadId: String, messageId: String) {
+        val current = getThreadMessages(threadId)
+        if (current.none { it.id == messageId }) {
+            return
+        }
+        setThreadMessages(
+            threadId,
+            current.filterNot { it.id == messageId }
+        )
+    }
 
     private fun setThreadMessages(threadId: String, messages: List<CodexMessage>) {
         val sortedMessages = messages.sortedBy { it.orderIndex }
